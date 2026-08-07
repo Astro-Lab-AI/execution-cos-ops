@@ -71,7 +71,13 @@ MANUS_API_KEY = os.environ.get("MANUS_API_KEY")
 
 CRM_SHEET_ID = "1xhcUpvdnNlkL85zYH_v50Bqk_XDO-hazeMhWAwBulM0"
 CRM_TAB = "Pilots"
-ELIGIBLE_STAGES = {"in production"}  # see note below — confirm before going live
+# Blocklist, not allowlist: "all pilots except Completed or Lost" per
+# Tomás's instruction 2026-08-07. Deliberately NOT an enumerated allowlist
+# of {"in production", "contract", "specifications", ...} — a stage value
+# added to the sheet later (one we've never seen before) is correctly
+# INCLUDED by default under this rule, rather than silently dropped
+# because it wasn't in a hardcoded allowlist.
+EXCLUDED_STAGES = {"completed", "lost"}
 
 POLL_INTERVAL_SECONDS = 20
 POLL_TIMEOUT_SECONDS = 60 * 30   # 30 min ceiling per project; tune to reality
@@ -94,7 +100,7 @@ def fetch_eligible_projects() -> list[Project]:
       2. APIs & Services -> Library -> enable "Google Sheets API"
       3. APIs & Services -> Credentials -> Create Credentials -> Service Account
       4. Open the new service account -> Keys -> Add Key -> JSON. Download it.
-      5. Open the Master Pilotos Summary sheet in your browser -> Share ->
+      5. Open the "Pipeline Overview — AstroLab CRM" sheet in your browser -> Share ->
          paste the service account's email (looks like
          xxx@yyy.iam.gserviceaccount.com, visible in the JSON file and in
          the Cloud Console) -> give it Viewer access.
@@ -135,7 +141,7 @@ def fetch_eligible_projects() -> list[Project]:
         al_id = row[IDX_AL_ID].strip()
         stage = row[IDX_STAGE].strip().lower()
         folder_url = row[IDX_FOLDER_URL].strip() if len(row) > IDX_FOLDER_URL else ""
-        if not al_id.startswith("AL-") or stage not in ELIGIBLE_STAGES:
+        if not al_id.startswith("AL-") or stage in EXCLUDED_STAGES:
             continue
         # No reliable "name" column confirmed yet, so use the folder URL as
         # the human-readable identifier for logs. The dispatcher only needs
@@ -205,7 +211,7 @@ def run(dry_run: bool, limit: int | None) -> None:
     if limit:
         projects = projects[:limit]
 
-    print(f"{len(projects)} eligible projects (stage in {ELIGIBLE_STAGES}).")
+    print(f"{len(projects)} eligible projects (all stages except {EXCLUDED_STAGES}).")
     if dry_run:
         print("DRY RUN — no tasks will be created.\n")
         for p in projects:
