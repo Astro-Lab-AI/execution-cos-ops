@@ -82,6 +82,14 @@ EXCLUDED_STAGES = {"completed", "lost"}
 POLL_INTERVAL_SECONDS = 20
 POLL_TIMEOUT_SECONDS = 60 * 30   # 30 min ceiling per project; tune to reality
 TERMINAL_STATUSES = {"completed", "failed", "stopped"}
+# A task that was JUST created can 404 on its first status check for a few
+# seconds while Manus finishes indexing it — this is not the same as the
+# task ID being wrong. Confirmed in production 2026-08-07: create_task
+# returned a valid task_id, and the very next call to get_task_status on
+# that same ID 404'd immediately. Give it this long before treating a 404
+# as a real failure.
+PROPAGATION_GRACE_SECONDS = 30
+PROPAGATION_RETRY_INTERVAL_SECONDS = 3
 
 
 @dataclass
@@ -190,10 +198,26 @@ def get_task_status(task_id: str) -> dict:
 def wait_for_completion(task_id: str, al_id: str) -> str:
     """Poll until the task reaches a terminal state. This is what makes the
     run sequential: the next create_task() call does not happen until this
-    returns."""
-    deadline = time.time() + POLL_TIMEOUT_SECONDS
+    returns.
+
+    A 404 in the first PROPAGATION_GRACE_SECONDS after task creation is
+    treated as "not indexed yet, not really missing" and retried on a short
+    interval. A 404 that persists past that window is a real problem (wrong
+    ID, task deleted, account mismatch) and gets raised rather than looped
+    on forever."""
+    created_at = time.time()
+    deadline = created_at + POLL_TIMEOUT_SECONDS
     while time.time() < deadline:
-        data = get_task_status(task_id)
+        try:
+            data = get_task_status(task_id)
+        except requests.HTTPError as e:
+            if (e.response is not None and e.response.status_code == 404
+                    and time.time() - created_at < PROPAGATION_GRACE_SECONDS):
+                print(f"  [{al_id}] task not indexed yet (404), retrying "
+                      f"in {PROPAGATION_RETRY_INTERVAL_SECONDS}s...")
+                time.sleep(PROPAGATION_RETRY_INTERVAL_SECONDS)
+                continue
+            raise  # past the grace window, or not a 404 — this is real
         status = data.get("status", "unknown")
         if status in TERMINAL_STATUSES:
             return status
