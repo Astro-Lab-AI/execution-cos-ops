@@ -1,0 +1,68 @@
+# .github/workflows/execution-cos-dispatch.yml
+#
+# Runs execution_cos_dispatcher.py on a schedule from GitHub's servers, so
+# there is no machine of yours that has to stay on. This REPLACES the old
+# "cron job inside Manus" — that one is what looped over all 41 projects in
+# a single session. This workflow instead calls out to Manus's API once per
+# project, sequentially, so isolation is enforced by the dispatcher script,
+# not by a scheduled prompt inside Manus.
+#
+# SETUP (one-time):
+#   1. Put this file at .github/workflows/execution-cos-dispatch.yml in any
+#      repo under the astrolab-ai GitHub org (a small private repo just for
+#      this is fine — it doesn't need to be a "real" codebase).
+#   2. Put execution_cos_dispatcher.py in the same repo, at the repo root
+#      (or update the `python` line below to match its path).
+#   3. Repo -> Settings -> Secrets and variables -> Actions -> New repository
+#      secret, add:
+#        MANUS_API_KEY               (from Manus dashboard -> Settings -> API)
+#        GOOGLE_SERVICE_ACCOUNT_JSON (paste the FULL content of the service
+#                                     account JSON file, not a file path)
+#   4. Commit and push. Check the "Actions" tab to confirm it's listed.
+#   5. Run it once manually first (Actions tab -> this workflow -> "Run
+#      workflow" button) with --dry-run before trusting the schedule.
+#
+# The cron below runs daily at 07:00 UTC. Adjust to match whenever the old
+# Manus cron used to fire. GitHub Actions cron uses UTC, not your local time.
+
+name: Execution CoS Dispatcher
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # 07:00 UTC daily — adjust to match old schedule
+  workflow_dispatch:        # lets you trigger it manually from the Actions tab
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # sequential runs over ~40 projects can take a while
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests google-api-python-client google-auth
+
+      - name: Write service account credentials
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Run dispatcher
+        env:
+          MANUS_API_KEY: ${{ secrets.MANUS_API_KEY }}
+          GOOGLE_APPLICATION_CREDENTIALS: service_account.json
+        # SAFETY DEFAULT: starts in --dry-run so a manual "Run workflow"
+        # click can never accidentally dispatch real Manus tasks. Remove
+        # --dry-run only after you've verified the project list in the log
+        # (Phase 8) and done a small --limit run (Phase 9). Once you're
+        # confident, delete the --dry-run flag on the line below and this
+        # workflow goes live on its schedule.
+        run: python execution_cos_dispatcher.py --dry-run
+
+      - name: Clean up credentials file
+        if: always()
+        run: rm -f service_account.json
