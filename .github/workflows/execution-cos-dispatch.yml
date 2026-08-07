@@ -61,7 +61,7 @@ jobs:
         # (Phase 8) and done a small --limit run (Phase 9). Once you're
         # confident, delete the --dry-run flag on the line below and this
         # workflow goes live on its schedule.
-        run: python execution_cos_dispatcher.py --limit 5
+        run: python -u execution_cos_dispatcher.py --limit 1
 
       - name: Clean up credentials file
         if: always()
