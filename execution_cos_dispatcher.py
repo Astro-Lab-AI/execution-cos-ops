@@ -349,10 +349,10 @@ def format_transcript(messages: list) -> str:
     the Manus replay UI."""
     if not messages:
         return "(no messages returned for this task)"
-    t0 = messages[0].get("timestamp", 0) / 1000.0
+    t0 = float(messages[0].get("timestamp", 0) or 0) / 1000.0
     lines = []
     for m in messages:
-        t = (m.get("timestamp", 0) / 1000.0) - t0
+        t = (float(m.get("timestamp", 0) or 0) / 1000.0) - t0
         mtype = m.get("type", "?")
         prefix = f"[+{t:6.0f}s] {mtype:22s}"
         if mtype == "tool_used":
@@ -374,7 +374,7 @@ def format_transcript(messages: list) -> str:
         elif mtype == "plan_update":
             steps = m.get("plan_update", {}).get("steps", [])
             summary = ", ".join(f"{s.get('title','?')}[{s.get('status','?')}]"
-                                for s in steps)
+                                 for s in steps)
             lines.append(f"{prefix} {summary}")
         elif mtype == "new_plan_step":
             lines.append(f"{prefix} + {m.get('new_plan_step', {}).get('title','')}")
