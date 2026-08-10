@@ -95,7 +95,13 @@ MANUS_API_KEY = os.environ.get("MANUS_API_KEY")
 # OAuth for Gmail/Workspace was completed. v2's task.create accepts
 # `connectors` and `force_skills` directly, which removes that prompt
 # entirely because the task already has what it needs at creation time.
-REQUIRED_CONNECTOR_NAMES = ["Google Workspace", "Gmail"]
+REQUIRED_CONNECTOR_NAMES = ["Google Workspace", "Gmail", "GitHub"]
+# GitHub added 2026-08-10: confirmed via a real task transcript that the
+# connector was disabled account-wide, not just unauthorized for one repo —
+# "GitHub connector is disabled (repo check not possible)". Same root cause
+# and same fix as Gmail/Workspace: connect it once in Manus Settings ->
+# Connectors, and it gets attached to every task at creation time from here
+# on, instead of being discovered missing mid-run.
 REQUIRED_SKILL_NAME = "execution-cos"
 
 CRM_SHEET_ID = "1xhcUpvdnNlkL85zYH_v50Bqk_XDO-hazeMhWAwBulM0"
