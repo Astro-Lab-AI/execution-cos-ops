@@ -288,18 +288,99 @@ def get_task_status(task_id: str) -> dict:
     """Reads the most recent status_update event via task.listMessages and
     normalises it to {"status": ..., "detail": ...}. status is one of
     'running', 'stopped' (=completed), 'error' (=failed), 'waiting'
-    (=needs a human — see below), or 'unknown' if no status event yet."""
+    (=needs a human — see below), or 'unknown' if no status event yet.
+
+    BUG FIXED 2026-08-10: this used to read resp.json().get("data", []).
+    The real v2 response puts the event list under "messages", not "data".
+    "data" doesn't exist in this response at all, so this was silently
+    reading an empty list on every single call, every project, every run —
+    meaning get_task_status could NEVER see a terminal status, no matter
+    how fast the real Manus task actually finished. Every "timeout" result
+    reported so far may have been a real success that this bug simply
+    never detected, sitting idle until the 30-minute ceiling fired instead
+    of returning the moment the task actually completed."""
     resp = requests.get(
         f"{MANUS_API_BASE}/task.listMessages",
         params={"task_id": task_id, "order": "desc", "limit": 10},
         headers=_manus_headers(), timeout=30)
     resp.raise_for_status()
-    for event in resp.json().get("data", []):
+    for event in resp.json().get("messages", []):
         if event.get("type") == "status_update":
             su = event["status_update"]
             return {"status": su.get("agent_status", "unknown"),
                     "detail": su.get("status_detail")}
     return {"status": "unknown", "detail": None}
+
+
+def get_task_transcript(task_id: str) -> list:
+    """Fetches the FULL event history for a task, paginated,
+    chronological, with verbose=true so tool calls and the agent's own
+    reasoning are included — not just the five basic event types. This is
+    for diagnosing what a task actually did, not for control flow.
+
+    Returns a flat list of message dicts in the same shape the API gives
+    them, oldest first."""
+    all_messages, cursor = [], None
+    while True:
+        params = {"task_id": task_id, "order": "asc", "limit": 200,
+                   "verbose": "true"}
+        if cursor:
+            params["cursor"] = cursor
+        resp = requests.get(f"{MANUS_API_BASE}/task.listMessages",
+                             params=params, headers=_manus_headers(),
+                             timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+        all_messages.extend(body.get("messages", []))
+        if not body.get("has_more"):
+            break
+        cursor = body.get("next_cursor")
+        if not cursor:
+            break  # has_more=true but no cursor given — stop rather than loop forever
+    return all_messages
+
+
+def format_transcript(messages: list) -> str:
+    """Turns the raw event list into a readable line-per-event summary:
+    what tool was used and its result, the agent's own stated reasoning,
+    plan step transitions, and any errors — in chronological order with
+    relative timestamps. This is what answers 'was it doing real distinct
+    work, or stuck repeating something' without anyone needing to watch
+    the Manus replay UI."""
+    if not messages:
+        return "(no messages returned for this task)"
+    t0 = messages[0].get("timestamp", 0) / 1000.0
+    lines = []
+    for m in messages:
+        t = (m.get("timestamp", 0) / 1000.0) - t0
+        mtype = m.get("type", "?")
+        prefix = f"[+{t:6.0f}s] {mtype:22s}"
+        if mtype == "tool_used":
+            tu = m.get("tool_used", {})
+            lines.append(f"{prefix} {tu.get('tool','?'):16s} "
+                         f"[{tu.get('status','?')}] {tu.get('brief','')}")
+        elif mtype == "explanation":
+            lines.append(f"{prefix} {m.get('explanation', {}).get('content', '')}")
+        elif mtype == "status_update":
+            su = m.get("status_update", {})
+            lines.append(f"{prefix} agent_status -> {su.get('agent_status','?')}  "
+                         f"{su.get('brief','')}")
+        elif mtype == "assistant_message":
+            content = m.get("assistant_message", {}).get("content", "")
+            lines.append(f"{prefix} {content[:200]}")
+        elif mtype == "error_message":
+            em = m.get("error_message", {})
+            lines.append(f"{prefix} !! {em.get('error_type','')}: {em.get('content','')}")
+        elif mtype == "plan_update":
+            steps = m.get("plan_update", {}).get("steps", [])
+            summary = ", ".join(f"{s.get('title','?')}[{s.get('status','?')}]"
+                                for s in steps)
+            lines.append(f"{prefix} {summary}")
+        elif mtype == "new_plan_step":
+            lines.append(f"{prefix} + {m.get('new_plan_step', {}).get('title','')}")
+        else:
+            lines.append(prefix)
+    return "\n".join(lines)
 
 
 def wait_for_completion(task_id: str, al_id: str) -> str:
@@ -438,8 +519,15 @@ def run(dry_run: bool, limit: int | None) -> None:
 
     failed = [r["al_id"] for r in results if r["status"] != "stopped"]
     if failed:
-
         print(f"\n{len(failed)} project(s) need attention: {', '.join(failed)}")
+        # Without this, GitHub Actions reports the whole run as "succeeded"
+        # any time the script itself doesn't crash — even if every single
+        # project timed out or errored. Confirmed 2026-08-10: a run where
+        # AL-2026-012 hit the 30-minute ceiling still showed a green
+        # checkmark, because "the script ran without an exception" and
+        # "the actual work completed" are different claims. A non-zero
+        # exit here is what makes the CI status mean something.
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -448,5 +536,16 @@ if __name__ == "__main__":
                      help="List eligible projects without dispatching")
     ap.add_argument("--limit", type=int, default=None,
                      help="Only dispatch the first N projects (sanity check)")
+    ap.add_argument("--inspect", metavar="TASK_ID", default=None,
+                     help="Print the full event transcript for one existing "
+                          "task (tool calls, agent reasoning, status "
+                          "changes) and exit. Does not dispatch anything.")
     args = ap.parse_args()
-    run(dry_run=args.dry_run, limit=args.limit)
+    if args.inspect:
+        if not MANUS_API_KEY:
+            sys.exit("MANUS_API_KEY not set.")
+        messages = get_task_transcript(args.inspect)
+        print(f"{len(messages)} events for task {args.inspect}\n")
+        print(format_transcript(messages))
+    else:
+        run(dry_run=args.dry_run, limit=args.limit)
