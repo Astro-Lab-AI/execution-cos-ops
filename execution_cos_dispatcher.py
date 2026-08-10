@@ -77,6 +77,7 @@ how project discovery works).
 
 import argparse
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -128,6 +129,8 @@ class Project:
     al_id: str
     name: str
     stage: str
+    folder_url: str = ""   # real Drive URL, resolved via the cell's hyperlink
+    folder_id: str = ""    # extracted from folder_url
 
 
 def fetch_eligible_projects() -> list[Project]:
@@ -167,27 +170,66 @@ def fetch_eligible_projects() -> list[Project]:
     creds = service_account.Credentials.from_service_account_file(
         CREDS_PATH, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     sheets = build("sheets", "v4", credentials=creds)
-    result = sheets.spreadsheets().values().get(
-        spreadsheetId=CRM_SHEET_ID, range=RANGE).execute()
 
-    # Column indices within each returned row, relative to COL_AL_ID = index 0
+    # BUG FIXED 2026-08-10: this used to call spreadsheets().values().get(),
+    # which only returns each cell's DISPLAYED text. Column E's cells all
+    # display the literal string "Open Drive" — that's the hyperlink's
+    # link text, not its target. That meaningless string was going straight
+    # into every dispatched prompt as the project's "location," so the
+    # agent had nothing to work with and had to search Drive by name
+    # instead. WiderProperty's real folder is named "12. WiderProperty"
+    # (an old numbering convention with no "AL-2026-012" in it at all), so
+    # that search failed, and the agent created a BRAND NEW duplicate
+    # project folder rather than finding the real one — confirmed in Drive
+    # 2026-08-10, folder "AL-2026-012 — WiderProperty" created that same
+    # day, sitting in a different shared drive entirely.
+    #
+    # spreadsheets().get() with this fields mask returns each cell's real
+    # hyperlink TARGET (cell.hyperlink), not its display text.
+    resp = sheets.spreadsheets().get(
+        spreadsheetId=CRM_SHEET_ID,
+        ranges=[RANGE],
+        fields="sheets.data.rowData.values(formattedValue,hyperlink)"
+    ).execute()
+    rows = resp.get("sheets", [{}])[0].get("data", [{}])[0].get("rowData", [])
+
     IDX_AL_ID, IDX_STAGE, IDX_FOLDER_URL = 0, 3, 4
 
     projects = []
-    for row in result.get("values", []):
-        if len(row) <= IDX_STAGE:
+    for row_data in rows:
+        cells = row_data.get("values", [])
+        if len(cells) <= IDX_STAGE:
             continue  # row doesn't even reach the stage column, skip
-        al_id = row[IDX_AL_ID].strip()
-        stage = row[IDX_STAGE].strip().lower()
-        folder_url = row[IDX_FOLDER_URL].strip() if len(row) > IDX_FOLDER_URL else ""
+        al_id = (cells[IDX_AL_ID].get("formattedValue") or "").strip()
+        stage = (cells[IDX_STAGE].get("formattedValue") or "").strip().lower()
         if not al_id.startswith("AL-") or stage in EXCLUDED_STAGES:
             continue
-        # No reliable "name" column confirmed yet, so use the folder URL as
-        # the human-readable identifier for logs. The dispatcher only needs
-        # the AL ID to build an isolated prompt (see build_prompt below) —
-        # `name` here is for your own readability in the console output,
-        # not used to select or scope anything.
-        projects.append(Project(al_id=al_id, name=folder_url or "(no folder link)", stage=stage))
+
+        folder_url = ""
+        if len(cells) > IDX_FOLDER_URL:
+            cell = cells[IDX_FOLDER_URL]
+            # The real link target, NOT cell.get("formattedValue") which
+            # would just be "Open Drive" again.
+            folder_url = cell.get("hyperlink") or ""
+
+        folder_id = ""
+        if folder_url:
+            m = re.search(r"/folders/([a-zA-Z0-9_-]+)", folder_url)
+            if m:
+                folder_id = m.group(1)
+
+        if not folder_url:
+            # Don't silently dispatch a task with no real location — that's
+            # exactly the condition that caused the duplicate-folder bug.
+            # Surface it instead so it gets fixed in the sheet, not papered
+            # over in the prompt.
+            print(f"  WARNING: {al_id} has no resolvable folder hyperlink in "
+                  f"column {COL_FOLDER_URL} — this project will be SKIPPED "
+                  f"rather than risk creating a duplicate folder again.")
+            continue
+
+        projects.append(Project(al_id=al_id, name=al_id, stage=stage,
+                                folder_url=folder_url, folder_id=folder_id))
     return projects
 
 
@@ -195,13 +237,27 @@ def build_prompt(project: Project) -> str:
     """
     The entire isolation guarantee lives in this function containing exactly
     one AL ID. Do not template this to accept a list.
+
+    FIXED 2026-08-10: now embeds the project's actual, resolved Drive folder
+    URL and forbids creating a new one. Before this fix, the prompt only
+    said the AL ID plus a decorative "(Open Drive)" label with no real
+    location in it, so the agent had to search Drive by name for something
+    matching the AL ID — and for projects using an older folder-naming
+    convention (no AL ID in the name), that search failed and the agent
+    created a brand new duplicate folder instead of finding the real one.
     """
     return (
-        f"Run the execution-cos skill for project {project.al_id} "
-        f"({project.name}) only. Do not reference, summarise, or ingest "
-        f"context from any other AL project. If you cannot determine a "
-        f"single unambiguous project from this instruction, stop and say so "
-        f"rather than guessing or covering more than one."
+        f"Run the execution-cos skill for project {project.al_id} only. "
+        f"The project's Drive folder is exactly this one, do not search "
+        f"Drive by name for it: {project.folder_url} "
+        f"(folder ID: {project.folder_id}). Operate only inside this "
+        f"folder. Under no circumstances create a new project folder, "
+        f"even if a name-based search would find nothing — this exact "
+        f"folder is authoritative. "
+        f"Do not reference, summarise, or ingest context from any other "
+        f"AL project. If you cannot determine a single unambiguous project "
+        f"from this instruction, stop and say so rather than guessing or "
+        f"covering more than one."
     )
 
 
@@ -349,10 +405,10 @@ def format_transcript(messages: list) -> str:
     the Manus replay UI."""
     if not messages:
         return "(no messages returned for this task)"
-    t0 = float(messages[0].get("timestamp", 0) or 0) / 1000.0
+    t0 = messages[0].get("timestamp", 0) / 1000.0
     lines = []
     for m in messages:
-        t = (float(m.get("timestamp", 0) or 0) / 1000.0) - t0
+        t = (m.get("timestamp", 0) / 1000.0) - t0
         mtype = m.get("type", "?")
         prefix = f"[+{t:6.0f}s] {mtype:22s}"
         if mtype == "tool_used":
@@ -374,7 +430,7 @@ def format_transcript(messages: list) -> str:
         elif mtype == "plan_update":
             steps = m.get("plan_update", {}).get("steps", [])
             summary = ", ".join(f"{s.get('title','?')}[{s.get('status','?')}]"
-                                 for s in steps)
+                                for s in steps)
             lines.append(f"{prefix} {summary}")
         elif mtype == "new_plan_step":
             lines.append(f"{prefix} + {m.get('new_plan_step', {}).get('title','')}")
