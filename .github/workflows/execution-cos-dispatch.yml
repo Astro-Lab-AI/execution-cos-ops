@@ -31,6 +31,15 @@ on:
   schedule:
     - cron: '0 7 * * *'   # 07:00 UTC daily — adjust to match old schedule
   workflow_dispatch:        # lets you trigger it manually from the Actions tab
+    inputs:
+      inspect_task_id:
+        description: >-
+          Task ID to inspect (paste one from a previous run's log, e.g.
+          ccxN8uyGeZVQpu4CLYRLU3). Leave BLANK for a normal dispatch run.
+          When set, this prints that task's full transcript and does NOT
+          dispatch anything — safe to run any time, purely read-only.
+        required: false
+        type: string
 
 jobs:
   dispatch:
@@ -55,13 +64,26 @@ jobs:
         env:
           MANUS_API_KEY: ${{ secrets.MANUS_API_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: service_account.json
-        # SAFETY DEFAULT: starts in --dry-run so a manual "Run workflow"
-        # click can never accidentally dispatch real Manus tasks. Remove
+          INSPECT_TASK_ID: ${{ github.event.inputs.inspect_task_id }}
+        # -u = unbuffered stdout. Without this, GitHub's log can sit
+        # completely silent for minutes while the script is actively
+        # working, because Python buffers stdout when it isn't attached to
+        # a real terminal. Confirmed 2026-08-07: a live run showed zero
+        # output for 2.5+ minutes purely from buffering, not because
+        # anything was stuck.
+        #
+        # SAFETY DEFAULT for the dispatch path: starts in --dry-run so a
+        # manual "Run workflow" click (with inspect_task_id left blank)
+        # can never accidentally dispatch real Manus tasks. Remove
         # --dry-run only after you've verified the project list in the log
-        # (Phase 8) and done a small --limit run (Phase 9). Once you're
-        # confident, delete the --dry-run flag on the line below and this
-        # workflow goes live on its schedule.
-        run: python -u execution_cos_dispatcher.py --limit 1
+        # (Phase 8) and done a small --limit run (Phase 9).
+        run: |
+          if [ -n "$INSPECT_TASK_ID" ]; then
+            echo "Inspecting task $INSPECT_TASK_ID — read-only, nothing will be dispatched."
+            python -u execution_cos_dispatcher.py --inspect "$INSPECT_TASK_ID"
+          else
+            python -u execution_cos_dispatcher.py --dry-run
+          fi
 
       - name: Clean up credentials file
         if: always()
