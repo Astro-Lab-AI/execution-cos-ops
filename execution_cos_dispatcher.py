@@ -422,10 +422,16 @@ def format_transcript(messages: list) -> str:
     the Manus replay UI."""
     if not messages:
         return "(no messages returned for this task)"
-    t0 = messages[0].get("timestamp", 0) / 1000.0
+    # BUG FIXED 2026-08-10: the real API returns "timestamp" as a STRING
+    # (e.g. "1691234567890"), not a number. `/ 1000.0` on a str raises
+    # TypeError immediately, on the very first event — confirmed against a
+    # real 106-event transcript that fetched and paginated correctly, then
+    # crashed formatting message #1. float() handles both str and numeric
+    # input; `or 0` covers a missing/empty value without crashing either.
+    t0 = float(messages[0].get("timestamp", 0) or 0) / 1000.0
     lines = []
     for m in messages:
-        t = (m.get("timestamp", 0) / 1000.0) - t0
+        t = (float(m.get("timestamp", 0) or 0) / 1000.0) - t0
         mtype = m.get("type", "?")
         prefix = f"[+{t:6.0f}s] {mtype:22s}"
         if mtype == "tool_used":
