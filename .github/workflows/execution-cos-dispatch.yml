@@ -82,7 +82,7 @@ jobs:
             echo "Inspecting task $INSPECT_TASK_ID — read-only, nothing will be dispatched."
             python -u execution_cos_dispatcher.py --inspect "$INSPECT_TASK_ID"
           else
-            python -u execution_cos_dispatcher.py --dry-run
+            python -u execution_cos_dispatcher.py --limit 1
           fi
 
       - name: Clean up credentials file
