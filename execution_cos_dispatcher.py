@@ -195,6 +195,7 @@ def fetch_eligible_projects() -> list[Project]:
 
     IDX_AL_ID, IDX_STAGE, IDX_FOLDER_URL = 0, 3, 4
 
+    missing_folder = []
     projects = []
     for row_data in rows:
         cells = row_data.get("values", [])
@@ -219,17 +220,33 @@ def fetch_eligible_projects() -> list[Project]:
                 folder_id = m.group(1)
 
         if not folder_url:
-            # Don't silently dispatch a task with no real location — that's
-            # exactly the condition that caused the duplicate-folder bug.
-            # Surface it instead so it gets fixed in the sheet, not papered
-            # over in the prompt.
-            print(f"  WARNING: {al_id} has no resolvable folder hyperlink in "
-                  f"column {COL_FOLDER_URL} — this project will be SKIPPED "
-                  f"rather than risk creating a duplicate folder again.")
+            # HARDENED 2026-08-10 per Tomás: "It's impossible that a project
+            # doesn't have a folder. If that is the case then it should
+            # throw an error. Not hallucinate." Originally this only
+            # printed a warning and skipped the one project — too soft.
+            # Every project in this sheet is expected to have a real Drive
+            # link, so hitting this means something is systemically
+            # broken (wrong range, a sheet edit, a parsing bug), not that
+            # this one project is a legitimate exception. The correct
+            # response is to stop the ENTIRE run and force a human to look,
+            # not quietly continue with 40 other projects while one is
+            # silently dropped.
+            missing_folder.append(al_id)
             continue
 
         projects.append(Project(al_id=al_id, name=al_id, stage=stage,
                                 folder_url=folder_url, folder_id=folder_id))
+
+    if missing_folder:
+        sys.exit(
+            f"ABORTED: {len(missing_folder)} eligible project(s) have no "
+            f"resolvable folder hyperlink in column {COL_FOLDER_URL}: "
+            f"{', '.join(missing_folder)}. This should never happen — every "
+            f"project is expected to have a real Drive link. Fix the sheet "
+            f"(or this script's column mapping) before running again. "
+            f"Refusing to dispatch ANY project this run rather than proceed "
+            f"with some projects silently missing.")
+
     return projects
 
 
