@@ -33,6 +33,7 @@ import importlib.util
 import os
 import re
 import sys
+import time
 
 MODULE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "execution_cos_dispatcher.py")
@@ -106,6 +107,7 @@ def run(limit: int, dry_run: bool):
             print(f"  FAILED to create task: {e}")
             results.append({"al_id": p.al_id, "status": "create_failed"})
             continue
+        print(f"  task_id: {task_id}")
 
         status = disp.wait_for_completion(task_id, p.al_id)
         print(f"  {p.al_id} -> {status}")
@@ -123,11 +125,41 @@ def run(limit: int, dry_run: bool):
                 row["verdict"] = "TRANSCRIPT_FETCH_FAILED"
                 print(f"  could not fetch/classify transcript: {e}")
 
+            # DIAGNOSTIC (temporary): credit_usage has read as 0 for every
+            # task in every real run so far, which is implausible for tasks
+            # that actually scanned Drive/Gmail/GitHub/Discord. This codebase
+            # has a track record of the real v2 API not matching what the
+            # code assumed (get_task_status originally read "data" instead of
+            # "messages" and silently saw nothing; timestamp was assumed
+            # numeric but is a string). credit_usage has never been verified
+            # against a real response body the way those were - so before
+            # trusting or "fixing" the number, print the raw detail dict, and
+            # take two readings (immediately + after a delay) to also rule out
+            # billing simply not being finalized yet at query time.
             try:
-                detail = disp.get_task_detail(task_id)
-                row["credits"] = detail.get("credit_usage")
-            except Exception:
+                detail_immediate = disp.get_task_detail(task_id)
+                print(f"  [diagnostic] task.detail immediately after "
+                      f"completion: {detail_immediate}")
+                row["credits"] = detail_immediate.get("credit_usage")
+            except Exception as e:
                 row["credits"] = None
+                print(f"  [diagnostic] task.detail fetch failed: {e}")
+
+            try:
+                print("  [diagnostic] waiting 30s to re-check for a billing "
+                      "delay...")
+                time.sleep(30)
+                detail_delayed = disp.get_task_detail(task_id)
+                print(f"  [diagnostic] task.detail 30s later: "
+                      f"{detail_delayed}")
+                delayed_credits = detail_delayed.get("credit_usage")
+                if delayed_credits != row["credits"]:
+                    print(f"  [diagnostic] VALUE CHANGED after delay: "
+                          f"{row['credits']!r} -> {delayed_credits!r} "
+                          f"(billing finalization lag confirmed)")
+                    row["credits"] = delayed_credits
+            except Exception as e:
+                print(f"  [diagnostic] delayed re-check failed: {e}")
 
         results.append(row)
 
