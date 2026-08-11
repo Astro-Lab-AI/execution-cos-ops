@@ -1,0 +1,71 @@
+# .github/workflows/verify-noop-gate.yml
+#
+# Manually-triggered check for the no-op cost gate (SKILL.md Step 4): does a
+# project that found nothing new actually skip the full Brain rewrite, or
+# does it claim "no-op" and rewrite anyway (the confirmed 2026-08-10
+# violation pattern)? Runs verify_noop_gate.py, which dispatches its own
+# small batch of real Manus tasks and classifies each transcript as
+# CLEAN_NOOP / REAL_REWRITE / VIOLATION.
+#
+# Reuses the same MANUS_API_KEY / GOOGLE_SERVICE_ACCOUNT_JSON secrets as
+# execution-cos-dispatch.yml — no separate credentials needed. Deliberately
+# a standalone workflow, not folded into the daily dispatch one, so running
+# a verification pass never risks changing what the scheduled job does.
+#
+# SAFETY DEFAULT: dry_run defaults to true, so a "Run workflow" click with
+# default inputs only lists who *would* be dispatched — costs nothing.
+# Set dry_run to false deliberately to spend real Manus credits on a real
+# verification batch.
+
+name: Verify No-Op Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "How many eligible projects to include in this verification batch"
+        required: false
+        default: "5"
+        type: string
+      dry_run:
+        description: "true = just list who would be dispatched, no real tasks created"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests google-api-python-client google-auth
+
+      - name: Write service account credentials
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Run verify_noop_gate.py
+        env:
+          MANUS_API_KEY: ${{ secrets.MANUS_API_KEY }}
+          GOOGLE_APPLICATION_CREDENTIALS: service_account.json
+        # -u = unbuffered stdout, same reasoning as execution-cos-dispatch.yml:
+        # without it GitHub's log can sit silent for minutes purely from
+        # Python's stdout buffering, not because anything is stuck.
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python -u verify_noop_gate.py --limit "${{ inputs.limit }}" --dry-run
+          else
+            python -u verify_noop_gate.py --limit "${{ inputs.limit }}"
+          fi
+
+      - name: Clean up credentials file
+        if: always()
+        run: rm -f service_account.json
