@@ -1,0 +1,42 @@
+# .github/workflows/list-project-names.yml
+#
+# Manually-triggered, read-only diagnostic: prints the CRM sheet's real
+# header row plus the full row for every currently-eligible AL ID, so a
+# human can validate the eligible-project list by client name before a real
+# dispatch. Does not call the Manus API and does not create/modify anything
+# -- only reads the CRM sheet via the same readonly service account already
+# used elsewhere. Reuses GOOGLE_SERVICE_ACCOUNT_JSON; does not need
+# MANUS_API_KEY at all.
+
+name: List Project Names
+
+on:
+  workflow_dispatch:
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install google-api-python-client google-auth
+
+      - name: Write service account credentials
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Run list_project_names.py
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: service_account.json
+        run: python -u list_project_names.py
+
+      - name: Clean up credentials file
+        if: always()
+        run: rm -f service_account.json
