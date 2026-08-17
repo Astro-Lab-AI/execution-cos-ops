@@ -109,13 +109,17 @@ REQUIRED_SKILL_NAME = "execution-cos"
 
 CRM_SHEET_ID = "1xhcUpvdnNlkL85zYH_v50Bqk_XDO-hazeMhWAwBulM0"
 CRM_TAB = "Pilots"
-# Blocklist, not allowlist: "all pilots except Completed or Lost" per
-# Tomás's instruction 2026-08-07. Deliberately NOT an enumerated allowlist
-# of {"in production", "contract", "specifications", ...} — a stage value
-# added to the sheet later (one we've never seen before) is correctly
-# INCLUDED by default under this rule, rather than silently dropped
-# because it wasn't in a hardcoded allowlist.
-EXCLUDED_STAGES = {"completed", "lost"}
+# ALLOWLIST, not blocklist, per Tomás's instruction 2026-08-17: only
+# "In Production" projects should get Brain updates. This reverses the
+# earlier 2026-08-07 design (a blocklist of {"completed", "lost"}, chosen
+# specifically so a new Stage value would be included by default). That
+# tradeoff is now intentionally flipped the other way: a new Stage value
+# introduced later is correctly EXCLUDED by default until someone decides
+# it should count as active, rather than silently getting dispatched.
+# NOTE: SKILL.md's Step 1 description of this eligibility rule (currently
+# "every Stage value except Completed or Lost") must be updated to match
+# on Manus — this repo does not control that file.
+INCLUDED_STAGES = {"in production"}
 
 POLL_INTERVAL_SECONDS = 20
 POLL_TIMEOUT_SECONDS = 60 * 30   # 30 min ceiling per project; tune to reality
@@ -212,7 +216,7 @@ def fetch_eligible_projects() -> list[Project]:
             continue  # row doesn't even reach the stage column, skip
         al_id = (cells[IDX_AL_ID].get("formattedValue") or "").strip()
         stage = (cells[IDX_STAGE].get("formattedValue") or "").strip().lower()
-        if not al_id.startswith("AL-") or stage in EXCLUDED_STAGES:
+        if not al_id.startswith("AL-") or stage not in INCLUDED_STAGES:
             continue
 
         folder_url = ""
@@ -527,7 +531,7 @@ def run(dry_run: bool, limit: int | None) -> None:
     if limit:
         projects = projects[:limit]
 
-    print(f"{len(projects)} eligible projects (all stages except {EXCLUDED_STAGES}).")
+    print(f"{len(projects)} eligible projects (stage in {INCLUDED_STAGES}).")
     if dry_run:
         print("DRY RUN — no tasks will be created.\n")
         for p in projects:

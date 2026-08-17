@@ -25,7 +25,10 @@ from googleapiclient.discovery import build
 
 CRM_SHEET_ID = "1xhcUpvdnNlkL85zYH_v50Bqk_XDO-hazeMhWAwBulM0"
 CRM_TAB = "Pilots"
-EXCLUDED_STAGES = {"completed", "lost"}
+# Kept in sync with execution_cos_dispatcher.py's INCLUDED_STAGES -- this
+# script exists to preview what a real dispatch would hit, so it must use
+# the same eligibility rule, not an independent guess at one.
+INCLUDED_STAGES = {"in production"}
 COL_AL_ID = "A"
 COL_STAGE = "D"
 # Row 1 is a warning banner, row 2 is blank, row 3 is the real header, data
@@ -56,14 +59,14 @@ def main():
     idx_al_id = ord(COL_AL_ID) - ord("A")
     idx_stage = ord(COL_STAGE) - ord("A")
 
-    print("Eligible projects (every Stage except Completed/Lost), full row:")
+    print(f"Eligible projects (stage in {INCLUDED_STAGES}), full row:")
     count = 0
     for row in rows:
         if len(row) <= idx_stage:
             continue
         al_id = (row[idx_al_id] if len(row) > idx_al_id else "").strip()
         stage = (row[idx_stage] if len(row) > idx_stage else "").strip().lower()
-        if not al_id.startswith("AL-") or stage in EXCLUDED_STAGES:
+        if not al_id.startswith("AL-") or stage not in INCLUDED_STAGES:
             continue
         count += 1
         cells = " | ".join(f"{chr(ord('A')+i)}={v}" for i, v in enumerate(row))

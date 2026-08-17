@@ -73,9 +73,8 @@ jobs:
         # anything was stuck.
         #
         # Scaled up from a --limit 5 trial (2026-08-10/11) to the full
-        # eligible set (~30 projects, everything except Completed/Lost
-        # stage) after: (a) verify_noop_gate.py confirmed the no-op cost
-        # gate holds with zero violations across real dispatches, and
+        # eligible set after: (a) verify_noop_gate.py confirmed the no-op
+        # cost gate holds with zero violations across real dispatches, and
         # (b) Manus 1.6 is currently free-tier ("free for a limited time"),
         # so there is no credit-bleed risk in scaling now. When that free
         # period ends, re-run verify_noop_gate.py to get a real per-project
