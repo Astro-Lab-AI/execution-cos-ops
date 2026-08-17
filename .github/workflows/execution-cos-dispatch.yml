@@ -72,17 +72,20 @@ jobs:
         # output for 2.5+ minutes purely from buffering, not because
         # anything was stuck.
         #
-        # SAFETY DEFAULT for the dispatch path: starts in --dry-run so a
-        # manual "Run workflow" click (with inspect_task_id left blank)
-        # can never accidentally dispatch real Manus tasks. Remove
-        # --dry-run only after you've verified the project list in the log
-        # (Phase 8) and done a small --limit run (Phase 9).
+        # Scaled up from a --limit 5 trial (2026-08-10/11) to the full
+        # eligible set (~30 projects, everything except Completed/Lost
+        # stage) after: (a) verify_noop_gate.py confirmed the no-op cost
+        # gate holds with zero violations across real dispatches, and
+        # (b) Manus 1.6 is currently free-tier ("free for a limited time"),
+        # so there is no credit-bleed risk in scaling now. When that free
+        # period ends, re-run verify_noop_gate.py to get a real per-project
+        # credit figure before assuming the full run is still cheap.
         run: |
           if [ -n "$INSPECT_TASK_ID" ]; then
             echo "Inspecting task $INSPECT_TASK_ID — read-only, nothing will be dispatched."
             python -u execution_cos_dispatcher.py --inspect "$INSPECT_TASK_ID"
           else
-            python -u execution_cos_dispatcher.py --limit 5
+            python -u execution_cos_dispatcher.py
           fi
 
       - name: Clean up credentials file
