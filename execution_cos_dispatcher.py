@@ -136,6 +136,38 @@ TERMINAL_STATUSES = {"stopped", "error"}
 PROPAGATION_GRACE_SECONDS = 30
 PROPAGATION_RETRY_INTERVAL_SECONDS = 3
 
+# CONFIRMED 2026-08-20: the scheduled run failed with an uncaught
+# TimeoutError from a plain network read timeout talking to the Sheets API
+# (googleapiclient -> httplib2 -> socket), before a single Manus task was
+# created. Zero client-facing side effects (nothing was dispatched yet),
+# but it meant the entire day's run silently produced zero Brain updates
+# until a human noticed. This retry exists so one transient network blip
+# doesn't fail the whole run — same reasoning as PROPAGATION_GRACE_SECONDS
+# above, applied to the Sheets read instead of the Manus status check.
+SHEETS_RETRY_ATTEMPTS = 3
+SHEETS_RETRY_BACKOFF_SECONDS = (5, 15, 30)
+
+
+def _execute_with_retry(request):
+    """Calls request.execute(), retrying on transient network errors
+    (timeouts, connection resets) with backoff. Does NOT retry on real API
+    errors (HttpError for bad requests, auth failures, etc.) -- those are
+    not transient and retrying them would just waste the backoff window
+    before failing anyway."""
+    last_exc = None
+    for attempt, delay in enumerate([0] + list(SHEETS_RETRY_BACKOFF_SECONDS), start=1):
+        if delay:
+            print(f"  Sheets API call failed ({last_exc}), "
+                  f"retrying in {delay}s (attempt {attempt}/{SHEETS_RETRY_ATTEMPTS + 1})...")
+            time.sleep(delay)
+        try:
+            return request.execute()
+        except (TimeoutError, ConnectionError, OSError) as e:
+            last_exc = e
+            if attempt > SHEETS_RETRY_ATTEMPTS:
+                raise
+    raise last_exc  # unreachable, satisfies static analysis
+
 
 @dataclass
 class Project:
@@ -199,11 +231,11 @@ def fetch_eligible_projects() -> list[Project]:
     #
     # spreadsheets().get() with this fields mask returns each cell's real
     # hyperlink TARGET (cell.hyperlink), not its display text.
-    resp = sheets.spreadsheets().get(
+    resp = _execute_with_retry(sheets.spreadsheets().get(
         spreadsheetId=CRM_SHEET_ID,
         ranges=[RANGE],
         fields="sheets.data.rowData.values(formattedValue,hyperlink)"
-    ).execute()
+    ))
     rows = resp.get("sheets", [{}])[0].get("data", [{}])[0].get("rowData", [])
 
     IDX_AL_ID, IDX_STAGE, IDX_FOLDER_URL = 0, 3, 4
