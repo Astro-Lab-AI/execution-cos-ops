@@ -18,6 +18,20 @@
 #        MANUS_API_KEY               (from Manus dashboard -> Settings -> API)
 #        GOOGLE_SERVICE_ACCOUNT_JSON (paste the FULL content of the service
 #                                     account JSON file, not a file path)
+#        DIGEST_SMTP_USER            (Gmail address the daily digest sends
+#                                     from -- added 2026-08-21, optional:
+#                                     the run still succeeds without it,
+#                                     just skips emailing the digest)
+#        DIGEST_SMTP_PASS            (a Gmail App Password for that address,
+#                                     from myaccount.google.com/apppasswords
+#                                     -- NOT the account's real password.
+#                                     Confirmed 2026-08-21: this setting is
+#                                     unavailable on Workspace-managed
+#                                     accounts by admin policy in at least
+#                                     one case -- use a personal Gmail
+#                                     account if your Workspace account
+#                                     shows "not available for your
+#                                     account" on that settings page.)
 #   4. Commit and push. Check the "Actions" tab to confirm it's listed.
 #   5. Run it once manually first (Actions tab -> this workflow -> "Run
 #      workflow" button) with --dry-run before trusting the schedule.
@@ -65,6 +79,10 @@ jobs:
           MANUS_API_KEY: ${{ secrets.MANUS_API_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: service_account.json
           INSPECT_TASK_ID: ${{ github.event.inputs.inspect_task_id }}
+          # Daily digest email, added 2026-08-21. DIGEST_TO defaults to
+          # DIGEST_SMTP_USER (self-send) inside the script if unset here.
+          DIGEST_SMTP_USER: ${{ secrets.DIGEST_SMTP_USER }}
+          DIGEST_SMTP_PASS: ${{ secrets.DIGEST_SMTP_PASS }}
         # -u = unbuffered stdout. Without this, GitHub's log can sit
         # completely silent for minutes while the script is actively
         # working, because Python buffers stdout when it isn't attached to
