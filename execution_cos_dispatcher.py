@@ -78,9 +78,11 @@ how project discovery works).
 import argparse
 import os
 import re
+import smtplib
 import sys
 import time
 from dataclasses import dataclass
+from email.mime.text import MIMEText
 
 import requests
 
@@ -120,6 +122,28 @@ CRM_TAB = "Pilots"
 # "every Stage value except Completed or Lost") must be updated to match
 # on Manus — this repo does not control that file.
 INCLUDED_STAGES = {"in production"}
+
+# Daily digest email — added 2026-08-21 per Tomás. Reuses each project's own
+# already-produced Step 6 output (escalation flag + next-steps summary), so
+# this never asks a Manus task to summarize across projects — that's the
+# exact cross-contamination bug (2026-07-27/07-31) this whole dispatcher
+# structure exists to prevent. Aggregation happens here, in Python, after
+# every task has already finished, from text each task already wrote about
+# only its own project.
+DIGEST_SMTP_HOST = "smtp.gmail.com"
+DIGEST_SMTP_PORT = 587
+DIGEST_SMTP_USER = os.environ.get("DIGEST_SMTP_USER")
+DIGEST_SMTP_PASS = os.environ.get("DIGEST_SMTP_PASS")
+# Defaults to self-send (same address for from/to) unless overridden —
+# matches the "just me" recipient decision 2026-08-21.
+DIGEST_TO = os.environ.get("DIGEST_TO") or DIGEST_SMTP_USER
+# SKILL.md Step 4's exact required no-op announcement — matching this
+# specific phrase is more precise than the fuzzy tool-call-pattern
+# classification verify_noop_gate.py uses, because it's the one string the
+# skill is instructed to emit for this exact case, not an inference from
+# transcript shape.
+NO_OP_PHRASE = "no changes since last check"
+ESCALATION_PHRASE = "escalation required"
 
 POLL_INTERVAL_SECONDS = 20
 POLL_TIMEOUT_SECONDS = 60 * 30   # 30 min ceiling per project; tune to reality
@@ -205,6 +229,7 @@ def fetch_eligible_projects() -> list[Project]:
 
     CREDS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
     COL_AL_ID = "A"       # e.g. "AL-2026-012"
+    COL_NAME = "B"        # human-readable project name, e.g. "WiderProperty"
     COL_STAGE = "D"       # "In Production" / "Completed" / "Contract" / etc
     COL_FOLDER_URL = "E"  # Google Drive folder link for the project
     # Row 1 is a warning banner, row 2 is blank, row 3 is the real header.
@@ -238,7 +263,7 @@ def fetch_eligible_projects() -> list[Project]:
     ))
     rows = resp.get("sheets", [{}])[0].get("data", [{}])[0].get("rowData", [])
 
-    IDX_AL_ID, IDX_STAGE, IDX_FOLDER_URL = 0, 3, 4
+    IDX_AL_ID, IDX_NAME, IDX_STAGE, IDX_FOLDER_URL = 0, 1, 3, 4
 
     missing_folder = []
     projects = []
@@ -247,6 +272,7 @@ def fetch_eligible_projects() -> list[Project]:
         if len(cells) <= IDX_STAGE:
             continue  # row doesn't even reach the stage column, skip
         al_id = (cells[IDX_AL_ID].get("formattedValue") or "").strip()
+        name = (cells[IDX_NAME].get("formattedValue") or "").strip() if len(cells) > IDX_NAME else ""
         stage = (cells[IDX_STAGE].get("formattedValue") or "").strip().lower()
         if not al_id.startswith("AL-") or stage not in INCLUDED_STAGES:
             continue
@@ -279,7 +305,7 @@ def fetch_eligible_projects() -> list[Project]:
             missing_folder.append(al_id)
             continue
 
-        projects.append(Project(al_id=al_id, name=al_id, stage=stage,
+        projects.append(Project(al_id=al_id, name=name or al_id, stage=stage,
                                 folder_url=folder_url, folder_id=folder_id))
 
     if missing_folder:
@@ -555,6 +581,106 @@ def wait_for_completion(task_id: str, al_id: str) -> str:
     return "timeout"
 
 
+def get_final_assistant_message(messages: list) -> str:
+    """Returns the content of the LAST assistant_message event, which per
+    SKILL.md Step 6 is where a single-project run always puts its escalation
+    flag (if any) and prioritised next steps -- i.e. exactly the per-project
+    summary a digest needs, already written by the task itself. Returns ""
+    if no assistant_message event exists (e.g. the task errored before
+    producing one)."""
+    for m in reversed(messages):
+        if m.get("type") == "assistant_message":
+            return m.get("assistant_message", {}).get("content", "") or ""
+    return ""
+
+
+def classify_for_digest(final_summary: str) -> str:
+    """Buckets a completed project for the daily digest using the skill's
+    OWN literal output strings, not an inference over tool-call shape (that
+    fuzzier approach is what verify_noop_gate.py uses, appropriate for its
+    narrow violation-detection job, but not precise enough here). Returns
+    one of "escalation" / "quiet" / "update"."""
+    lower = final_summary.lower()
+    if ESCALATION_PHRASE in lower:
+        return "escalation"
+    if NO_OP_PHRASE in lower:
+        return "quiet"
+    return "update"
+
+
+def build_digest_email(results: list, run_seconds: float) -> tuple:
+    """Builds (subject, body) for the daily digest from data ALREADY
+    collected during the dispatch loop -- no new Manus calls, no cross-
+    project context ever assembled inside a task. Grouped by urgency so
+    escalations and real updates aren't buried under quiet no-ops, which on
+    most days will be the majority of the batch."""
+    # "attention" (dispatch problems: timeout/error/waiting/create_failed) is
+    # mutually exclusive with the other three buckets, which only ever apply
+    # to a project that actually reached "stopped" -- a project that never
+    # finished has no real summary to classify and shouldn't be double-
+    # counted under "update" (its default bucket) as well.
+    attention = [r for r in results if r["status"] != "stopped"]
+    escalations = [r for r in results if r.get("digest_bucket") == "escalation" and r["status"] == "stopped"]
+    updates = [r for r in results if r.get("digest_bucket") == "update" and r["status"] == "stopped"]
+    quiet = [r for r in results if r.get("digest_bucket") == "quiet" and r["status"] == "stopped"]
+
+    lines = []
+    if escalations:
+        lines.append(f"⚠️ ESCALATIONS ({len(escalations)})")
+        for r in escalations:
+            lines.append(f"  {r['al_id']} {r['name']}")
+            lines.append(f"    {r['summary'][:1000]}")
+        lines.append("")
+    if updates:
+        lines.append(f"📋 REAL UPDATES ({len(updates)}) — something changed")
+        for r in updates:
+            lines.append(f"  {r['al_id']} {r['name']}")
+            lines.append(f"    {r['summary'][:1000]}")
+        lines.append("")
+    if attention:
+        lines.append(f"❌ NEEDS ATTENTION ({len(attention)}) — dispatch problem")
+        for r in attention:
+            lines.append(f"  {r['al_id']} {r.get('name', '')}  status={r['status']}")
+        lines.append("")
+    if quiet:
+        lines.append(f"💤 QUIET ({len(quiet)}) — no-op, nothing new")
+        lines.append("  " + ", ".join(r["al_id"] for r in quiet))
+        lines.append("")
+
+    lines.append(f"— {len(results)} projects, {run_seconds/60:.0f} min —")
+
+    escalation_flag = " [ESCALATIONS]" if escalations else ""
+    subject = (f"AstroLab Execution CoS — Daily Digest{escalation_flag} — "
+               f"{len(escalations)} escalation(s), {len(updates)} update(s), "
+               f"{len(quiet)} quiet")
+    return subject, "\n".join(lines)
+
+
+def send_digest_email(subject: str, body: str) -> None:
+    """Sends the digest via Gmail SMTP. Never allowed to affect control flow
+    or the run's exit code -- a failed email send is not the same claim as
+    a failed dispatch, same reasoning already applied to credit_usage fetch
+    failures above. Silently does nothing (with a printed reason) if the
+    SMTP credentials aren't configured, so this is safe to call from any
+    environment, not just one with the digest secrets set up."""
+    if not DIGEST_SMTP_USER or not DIGEST_SMTP_PASS or not DIGEST_TO:
+        print("  (digest email skipped — DIGEST_SMTP_USER/DIGEST_SMTP_PASS/"
+              "DIGEST_TO not fully configured)")
+        return
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = DIGEST_SMTP_USER
+        msg["To"] = DIGEST_TO
+        with smtplib.SMTP(DIGEST_SMTP_HOST, DIGEST_SMTP_PORT, timeout=30) as smtp:
+            smtp.starttls()
+            smtp.login(DIGEST_SMTP_USER, DIGEST_SMTP_PASS)
+            smtp.sendmail(DIGEST_SMTP_USER, [DIGEST_TO], msg.as_string())
+        print(f"  digest email sent to {DIGEST_TO}")
+    except Exception as e:
+        print(f"  (digest email failed to send: {e})")
+
+
 def run(dry_run: bool, limit: int | None) -> None:
     if not MANUS_API_KEY and not dry_run:
         sys.exit("MANUS_API_KEY not set. Export it or use --dry-run.")
@@ -589,7 +715,7 @@ def run(dry_run: bool, limit: int | None) -> None:
             task_id = create_task(prompt, connector_ids, skill_id)
         except requests.HTTPError as e:
             print(f"  FAILED to create task: {e}")
-            results.append({"al_id": p.al_id, "status": "create_failed"})
+            results.append({"al_id": p.al_id, "name": p.name, "status": "create_failed"})
             continue
 
         print(f"  task {task_id} created — waiting for completion "
@@ -609,8 +735,24 @@ def run(dry_run: bool, limit: int | None) -> None:
         except requests.HTTPError as e:
             print(f"  (could not fetch credit_usage for {p.al_id}: {e})")
 
-        results.append({"al_id": p.al_id, "status": status,
-                         "wall_seconds": wall_seconds, "credits": credits})
+        # Digest data: reuse the task's own final summary (see Step 6 of
+        # SKILL.md) rather than asking anything new of Manus. A fetch
+        # failure here must not affect control flow, same reasoning as
+        # credit_usage above — default to "update" (most visible bucket)
+        # so a fetch failure never silently hides a project that might
+        # actually need attention.
+        summary, digest_bucket = "(summary unavailable)", "update"
+        if status == "stopped":
+            try:
+                messages = get_task_transcript(task_id)
+                summary = get_final_assistant_message(messages) or "(no summary produced)"
+                digest_bucket = classify_for_digest(summary)
+            except Exception as e:
+                print(f"  (could not fetch summary for {p.al_id}: {e})")
+
+        results.append({"al_id": p.al_id, "name": p.name, "status": status,
+                         "wall_seconds": wall_seconds, "credits": credits,
+                         "summary": summary, "digest_bucket": digest_bucket})
 
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -640,6 +782,11 @@ def run(dry_run: bool, limit: int | None) -> None:
         else:
             print("  credits     (not available — check API key permissions "
                   "for task.detail)")
+
+    print("\nBuilding daily digest email...")
+    total_seconds = sum(r.get("wall_seconds", 0) for r in results)
+    subject, body = build_digest_email(results, total_seconds)
+    send_digest_email(subject, body)
 
     failed = [r["al_id"] for r in results if r["status"] != "stopped"]
     if failed:
