@@ -145,7 +145,28 @@ DIGEST_TO = os.environ.get("DIGEST_TO") or DIGEST_SMTP_USER
 # classification verify_noop_gate.py uses, because it's the one string the
 # skill is instructed to emit for this exact case, not an inference from
 # transcript shape.
-NO_OP_PHRASE = "no changes since last check"
+# CONFIRMED 2026-09-07: the single exact phrase below missed a real no-op
+# run -- the skill reported "its body was not rewritten because no
+# project-specific substantive changes were found" instead of the literal
+# SKILL.md Step 4 phrase, so classify_for_digest defaulted it to "update"
+# and it showed up mislabeled. Widened to a short list of strong, narrowly-
+# targeted phrases rather than a loose fuzzy match: each one specifically
+# describes the skill NOT rewriting the Brain body, which a genuine update
+# would essentially never say (a real update, by definition, rewrites the
+# body). Deliberately NOT widened with looser patterns like "no changes
+# found" or "nothing new" -- those risk false-matching a real update that
+# merely mentions "no changes" to ONE thing in passing, and unlike the
+# no-op-gate VIOLATION check in verify_noop_gate.py (which only flags a
+# problem for a human to look at), a false "quiet" classification HERE
+# hides that project's summary text entirely -- the quiet bucket only ever
+# shows an AL ID, never the text. Better to occasionally show a genuinely
+# quiet project under "update" (mislabeled but still fully visible) than
+# to occasionally hide a genuine update under "quiet" (invisible).
+NO_OP_PHRASES = [
+    "no changes since last check",
+    "not rewritten",
+    "left untouched",
+]
 ESCALATION_PHRASE = "escalation required"
 
 POLL_INTERVAL_SECONDS = 20
@@ -642,11 +663,13 @@ def classify_for_digest(final_summary: str) -> str:
     OWN literal output strings, not an inference over tool-call shape (that
     fuzzier approach is what verify_noop_gate.py uses, appropriate for its
     narrow violation-detection job, but not precise enough here). Returns
-    one of "escalation" / "quiet" / "update"."""
+    one of "escalation" / "quiet" / "update". See NO_OP_PHRASES above for
+    why this checks several specific phrases rather than one exact string
+    or a loose fuzzy pattern."""
     lower = final_summary.lower()
     if ESCALATION_PHRASE in lower:
         return "escalation"
-    if NO_OP_PHRASE in lower:
+    if any(phrase in lower for phrase in NO_OP_PHRASES):
         return "quiet"
     return "update"
 
