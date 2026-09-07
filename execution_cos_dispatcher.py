@@ -661,20 +661,10 @@ def classify_for_digest(final_summary: str) -> str:
 # for accessibility and for any client that doesn't. `tables` extension is
 # required -- without it, markdown-formatted tables render as a literal
 # paragraph of "|" characters instead of an actual <table>.
-DIGEST_SUMMARY_MAX_CHARS = 1500
-
-
-def _truncate_at_boundary(text: str, max_chars: int) -> str:
-    """Truncates at the last newline before max_chars rather than a hard
-    character cut, so a markdown table or list isn't sliced mid-row --
-    which would render as a broken/incomplete table or malformed list in
-    the HTML version rather than just losing some trailing prose."""
-    if len(text) <= max_chars:
-        return text
-    cut = text.rfind("\n", 0, max_chars)
-    if cut <= 0:
-        cut = max_chars
-    return text[:cut].rstrip() + "\n\n*(truncated)*"
+#
+# NOT truncated (removed 2026-09-07 per Tomás, after a real escalation got
+# cut off mid-explanation) -- escalations especially are exactly the case
+# where losing detail hurts most, so every summary is shown in full.
 
 
 def build_digest_email(results: list, run_seconds: float) -> tuple:
@@ -700,13 +690,13 @@ def build_digest_email(results: list, run_seconds: float) -> tuple:
         text_lines.append(f"⚠️ ESCALATIONS ({len(escalations)})")
         for r in escalations:
             text_lines.append(f"  {r['al_id']} {r['name']}")
-            text_lines.append(f"    {_truncate_at_boundary(r['summary'], DIGEST_SUMMARY_MAX_CHARS)}")
+            text_lines.append(f"    {r['summary']}")
         text_lines.append("")
     if updates:
         text_lines.append(f"📋 REAL UPDATES ({len(updates)}) — something changed")
         for r in updates:
             text_lines.append(f"  {r['al_id']} {r['name']}")
-            text_lines.append(f"    {_truncate_at_boundary(r['summary'], DIGEST_SUMMARY_MAX_CHARS)}")
+            text_lines.append(f"    {r['summary']}")
         text_lines.append("")
     if attention:
         text_lines.append(f"❌ NEEDS ATTENTION ({len(attention)}) — dispatch problem")
@@ -723,8 +713,7 @@ def build_digest_email(results: list, run_seconds: float) -> tuple:
     # ---- HTML version ----
     def project_card(r, accent):
         summary_html = markdown_lib.markdown(
-            _truncate_at_boundary(r["summary"], DIGEST_SUMMARY_MAX_CHARS),
-            extensions=["tables", "fenced_code", "nl2br"])
+            r["summary"], extensions=["tables", "fenced_code", "nl2br"])
         al_id = html.escape(r["al_id"])
         name = html.escape(r.get("name", ""))
         return f"""
