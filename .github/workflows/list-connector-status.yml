@@ -1,0 +1,33 @@
+# .github/workflows/list-connector-status.yml
+#
+# Manually-triggered, read-only diagnostic: prints Manus's connector.list
+# response in full for each required connector (Google Workspace, Gmail,
+# GitHub, Discord), since task.detail has no per-connector health field at
+# all (confirmed 2026-09-07) and every real dispatched task was landing in
+# a "waiting" (connectorOauthExpired) state with no further detail. Does
+# not dispatch anything, does not touch the CRM sheet or any Brain -- reads
+# only from the Manus API via the existing MANUS_API_KEY secret.
+
+name: List Connector Status
+
+on:
+  workflow_dispatch:
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run list_connector_status.py
+        env:
+          MANUS_API_KEY: ${{ secrets.MANUS_API_KEY }}
+        run: python -u list_connector_status.py
