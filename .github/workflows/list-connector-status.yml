@@ -25,7 +25,11 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        # markdown added 2026-09-07: this script loads execution_cos_dispatcher.py
+        # as a module (see load_dispatcher()), which now imports markdown at
+        # module level for the digest-email feature -- needed here even
+        # though this script never calls the digest functions itself.
+        run: pip install requests markdown
 
       - name: Run list_connector_status.py
         env:

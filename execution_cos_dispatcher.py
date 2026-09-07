@@ -76,14 +76,17 @@ how project discovery works).
 """
 
 import argparse
+import html
 import os
 import re
 import smtplib
 import sys
 import time
 from dataclasses import dataclass
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import markdown as markdown_lib
 import requests
 
 MANUS_API_BASE = "https://api.manus.ai/v2"
@@ -648,12 +651,38 @@ def classify_for_digest(final_summary: str) -> str:
     return "update"
 
 
+# Per-project summary text is Manus's own markdown output (headers, bold,
+# tables -- see SKILL.md's "Output to User" format), not plain prose. The
+# original plain-text digest just dumped that raw markdown into an email
+# body, so Gmail showed literal "##"/"**"/"|---|" characters instead of
+# formatting (confirmed via a real digest 2026-09-07 -- looked broken).
+# Fixed by rendering to real HTML and sending BOTH parts (multipart/
+# alternative): HTML for clients that render it, plain text as a fallback
+# for accessibility and for any client that doesn't. `tables` extension is
+# required -- without it, markdown-formatted tables render as a literal
+# paragraph of "|" characters instead of an actual <table>.
+DIGEST_SUMMARY_MAX_CHARS = 1500
+
+
+def _truncate_at_boundary(text: str, max_chars: int) -> str:
+    """Truncates at the last newline before max_chars rather than a hard
+    character cut, so a markdown table or list isn't sliced mid-row --
+    which would render as a broken/incomplete table or malformed list in
+    the HTML version rather than just losing some trailing prose."""
+    if len(text) <= max_chars:
+        return text
+    cut = text.rfind("\n", 0, max_chars)
+    if cut <= 0:
+        cut = max_chars
+    return text[:cut].rstrip() + "\n\n*(truncated)*"
+
+
 def build_digest_email(results: list, run_seconds: float) -> tuple:
-    """Builds (subject, body) for the daily digest from data ALREADY
-    collected during the dispatch loop -- no new Manus calls, no cross-
-    project context ever assembled inside a task. Grouped by urgency so
-    escalations and real updates aren't buried under quiet no-ops, which on
-    most days will be the majority of the batch."""
+    """Builds (subject, text_body, html_body) for the daily digest from data
+    ALREADY collected during the dispatch loop -- no new Manus calls, no
+    cross-project context ever assembled inside a task. Grouped by urgency
+    so escalations and real updates aren't buried under quiet no-ops, which
+    on most days will be the majority of the batch."""
     # "attention" (dispatch problems: timeout/error/waiting/create_failed) is
     # mutually exclusive with the other three buckets, which only ever apply
     # to a project that actually reached "stopped" -- a project that never
@@ -664,54 +693,105 @@ def build_digest_email(results: list, run_seconds: float) -> tuple:
     updates = [r for r in results if r.get("digest_bucket") == "update" and r["status"] == "stopped"]
     quiet = [r for r in results if r.get("digest_bucket") == "quiet" and r["status"] == "stopped"]
 
-    lines = []
+    # ---- plain-text fallback (unchanged shape from before, still fully
+    # readable on its own even with the raw markdown symbols in it) ----
+    text_lines = []
     if escalations:
-        lines.append(f"⚠️ ESCALATIONS ({len(escalations)})")
+        text_lines.append(f"⚠️ ESCALATIONS ({len(escalations)})")
         for r in escalations:
-            lines.append(f"  {r['al_id']} {r['name']}")
-            lines.append(f"    {r['summary'][:1000]}")
-        lines.append("")
+            text_lines.append(f"  {r['al_id']} {r['name']}")
+            text_lines.append(f"    {_truncate_at_boundary(r['summary'], DIGEST_SUMMARY_MAX_CHARS)}")
+        text_lines.append("")
     if updates:
-        lines.append(f"📋 REAL UPDATES ({len(updates)}) — something changed")
+        text_lines.append(f"📋 REAL UPDATES ({len(updates)}) — something changed")
         for r in updates:
-            lines.append(f"  {r['al_id']} {r['name']}")
-            lines.append(f"    {r['summary'][:1000]}")
-        lines.append("")
+            text_lines.append(f"  {r['al_id']} {r['name']}")
+            text_lines.append(f"    {_truncate_at_boundary(r['summary'], DIGEST_SUMMARY_MAX_CHARS)}")
+        text_lines.append("")
     if attention:
-        lines.append(f"❌ NEEDS ATTENTION ({len(attention)}) — dispatch problem")
+        text_lines.append(f"❌ NEEDS ATTENTION ({len(attention)}) — dispatch problem")
         for r in attention:
-            lines.append(f"  {r['al_id']} {r.get('name', '')}  status={r['status']}")
-        lines.append("")
+            text_lines.append(f"  {r['al_id']} {r.get('name', '')}  status={r['status']}")
+        text_lines.append("")
     if quiet:
-        lines.append(f"💤 QUIET ({len(quiet)}) — no-op, nothing new")
-        lines.append("  " + ", ".join(r["al_id"] for r in quiet))
-        lines.append("")
+        text_lines.append(f"💤 QUIET ({len(quiet)}) — no-op, nothing new")
+        text_lines.append("  " + ", ".join(r["al_id"] for r in quiet))
+        text_lines.append("")
+    text_lines.append(f"— {len(results)} projects, {run_seconds/60:.0f} min —")
+    text_body = "\n".join(text_lines)
 
-    lines.append(f"— {len(results)} projects, {run_seconds/60:.0f} min —")
+    # ---- HTML version ----
+    def project_card(r, accent):
+        summary_html = markdown_lib.markdown(
+            _truncate_at_boundary(r["summary"], DIGEST_SUMMARY_MAX_CHARS),
+            extensions=["tables", "fenced_code", "nl2br"])
+        al_id = html.escape(r["al_id"])
+        name = html.escape(r.get("name", ""))
+        return f"""
+        <div style="margin:0 0 14px 0;padding:10px 14px;border-left:4px solid {accent};background:#f8f9fa;border-radius:0 4px 4px 0;">
+          <div style="font-weight:600;font-size:14px;color:#1a1a1a;margin-bottom:4px;">{al_id} — {name}</div>
+          <div style="font-size:13px;color:#333;line-height:1.5;">{summary_html}</div>
+        </div>"""
+
+    def section_header(emoji, title, accent):
+        return (f'<h2 style="font-size:15px;font-weight:700;color:{accent};'
+                f'margin:22px 0 10px 0;">{emoji} {html.escape(title)}</h2>')
+
+    html_parts = ['<div style="font-family:-apple-system,BlinkMacSystemFont,'
+                  '\'Segoe UI\',Roboto,sans-serif;max-width:680px;margin:0 auto;">']
+    if escalations:
+        html_parts.append(section_header("⚠️", f"ESCALATIONS ({len(escalations)})", "#c0392b"))
+        html_parts += [project_card(r, "#c0392b") for r in escalations]
+    if updates:
+        html_parts.append(section_header("📋", f"REAL UPDATES ({len(updates)}) — something changed", "#2471a3"))
+        html_parts += [project_card(r, "#2471a3") for r in updates]
+    if attention:
+        html_parts.append(section_header("❌", f"NEEDS ATTENTION ({len(attention)}) — dispatch problem", "#b9770e"))
+        rows = "".join(
+            f'<li style="font-size:13px;color:#333;margin-bottom:4px;">'
+            f'{html.escape(r["al_id"])} {html.escape(r.get("name", ""))} '
+            f'— status={html.escape(r["status"])}</li>'
+            for r in attention)
+        html_parts.append(f'<ul style="margin:0 0 14px 0;padding-left:18px;">{rows}</ul>')
+    if quiet:
+        html_parts.append(section_header("💤", f"QUIET ({len(quiet)}) — no-op, nothing new", "#7f8c8d"))
+        html_parts.append(f'<div style="font-size:13px;color:#555;margin-bottom:14px;">'
+                           f'{html.escape(", ".join(r["al_id"] for r in quiet))}</div>')
+    html_parts.append(f'<div style="font-size:12px;color:#999;margin-top:20px;'
+                       f'border-top:1px solid #eee;padding-top:10px;">'
+                       f'{len(results)} projects, {run_seconds/60:.0f} min</div>')
+    html_parts.append("</div>")
+    html_body = "\n".join(html_parts)
 
     escalation_flag = " [ESCALATIONS]" if escalations else ""
     subject = (f"AstroLab Execution CoS — Daily Digest{escalation_flag} — "
                f"{len(escalations)} escalation(s), {len(updates)} update(s), "
                f"{len(quiet)} quiet")
-    return subject, "\n".join(lines)
+    return subject, text_body, html_body
 
 
-def send_digest_email(subject: str, body: str) -> None:
-    """Sends the digest via Gmail SMTP. Never allowed to affect control flow
-    or the run's exit code -- a failed email send is not the same claim as
-    a failed dispatch, same reasoning already applied to credit_usage fetch
-    failures above. Silently does nothing (with a printed reason) if the
-    SMTP credentials aren't configured, so this is safe to call from any
-    environment, not just one with the digest secrets set up."""
+def send_digest_email(subject: str, text_body: str, html_body: str) -> None:
+    """Sends the digest via Gmail SMTP as multipart/alternative (plain text
+    + HTML). Never allowed to affect control flow or the run's exit code --
+    a failed email send is not the same claim as a failed dispatch, same
+    reasoning already applied to credit_usage fetch failures above.
+    Silently does nothing (with a printed reason) if the SMTP credentials
+    aren't configured, so this is safe to call from any environment, not
+    just one with the digest secrets set up."""
     if not DIGEST_SMTP_USER or not DIGEST_SMTP_PASS or not DIGEST_TO:
         print("  (digest email skipped — DIGEST_SMTP_USER/DIGEST_SMTP_PASS/"
               "DIGEST_TO not fully configured)")
         return
     try:
-        msg = MIMEText(body, "plain", "utf-8")
+        msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = DIGEST_SMTP_USER
         msg["To"] = DIGEST_TO
+        # Order matters for multipart/alternative: clients render the LAST
+        # part they understand, so plain text (the fallback) goes first and
+        # HTML (the preferred rendering) goes last.
+        msg.attach(MIMEText(text_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
         with smtplib.SMTP(DIGEST_SMTP_HOST, DIGEST_SMTP_PORT, timeout=30) as smtp:
             smtp.starttls()
             smtp.login(DIGEST_SMTP_USER, DIGEST_SMTP_PASS)
@@ -825,8 +905,8 @@ def run(dry_run: bool, limit: int | None) -> None:
 
     print("\nBuilding daily digest email...")
     total_seconds = sum(r.get("wall_seconds", 0) for r in results)
-    subject, body = build_digest_email(results, total_seconds)
-    send_digest_email(subject, body)
+    subject, text_body, html_body = build_digest_email(results, total_seconds)
+    send_digest_email(subject, text_body, html_body)
 
     failed = [r["al_id"] for r in results if r["status"] != "stopped"]
     if failed:
