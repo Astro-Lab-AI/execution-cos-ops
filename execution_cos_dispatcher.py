@@ -160,6 +160,14 @@ TERMINAL_STATUSES = {"stopped", "error"}
 PROPAGATION_GRACE_SECONDS = 30
 PROPAGATION_RETRY_INTERVAL_SECONDS = 3
 
+# CONFIRMED 2026-09-06: a plain 500 from Manus on a single status poll
+# crashed the whole run uncaught, mid-way through project 13 of 14 — the
+# last 2 projects that day never got attempted, and no digest email was
+# sent (that code only runs after this loop finishes). Same reasoning as
+# the 404-during-grace retry above, applied to a different transient shape.
+SERVER_ERROR_RETRY_ATTEMPTS = 3
+SERVER_ERROR_RETRY_INTERVAL_SECONDS = 10
+
 # CONFIRMED 2026-08-20: the scheduled run failed with an uncaught
 # TimeoutError from a plain network read timeout talking to the Sheets API
 # (googleapiclient -> httplib2 -> socket), before a single Manus task was
@@ -544,6 +552,15 @@ def wait_for_completion(task_id: str, al_id: str) -> str:
     ID, task deleted, account mismatch) and gets raised rather than looped
     on forever.
 
+    CONFIRMED 2026-09-06: a plain 500 Internal Server Error from Manus's own
+    API on this exact call crashed the whole script uncaught, mid-run, on
+    project 13 of 14 -- the last 2 projects that day were never attempted
+    AND no digest email was sent (that code runs after this loop finishes).
+    A transient server-side error on ONE poll of a healthy task is not the
+    same claim as the task actually failing, so this now retries a bounded
+    number of times on 5xx before giving up -- same reasoning as the 404
+    grace window above, just for a different transient-failure shape.
+
     'waiting' is deliberately NOT auto-confirmed here. Some waiting events
     (gmailSendAction, deployAction) have real-world side effects, and the
     skill's own rules already require explicit human confirmation before
@@ -554,6 +571,7 @@ def wait_for_completion(task_id: str, al_id: str) -> str:
     guessing what to click."""
     created_at = time.time()
     deadline = created_at + POLL_TIMEOUT_SECONDS
+    server_error_retries = 0
     while time.time() < deadline:
         try:
             data = get_task_status(task_id)
@@ -564,7 +582,16 @@ def wait_for_completion(task_id: str, al_id: str) -> str:
                       f"in {PROPAGATION_RETRY_INTERVAL_SECONDS}s...")
                 time.sleep(PROPAGATION_RETRY_INTERVAL_SECONDS)
                 continue
-            raise  # past the grace window, or not a 404 — this is real
+            if (e.response is not None and e.response.status_code >= 500
+                    and server_error_retries < SERVER_ERROR_RETRY_ATTEMPTS):
+                server_error_retries += 1
+                print(f"  [{al_id}] Manus API returned "
+                      f"{e.response.status_code} polling status (attempt "
+                      f"{server_error_retries}/{SERVER_ERROR_RETRY_ATTEMPTS}), "
+                      f"retrying in {SERVER_ERROR_RETRY_INTERVAL_SECONDS}s...")
+                time.sleep(SERVER_ERROR_RETRY_INTERVAL_SECONDS)
+                continue
+            raise  # past all retries, or not a 404/5xx case — this is real
         status = data.get("status", "unknown")
         if status in TERMINAL_STATUSES:
             return status
@@ -574,6 +601,19 @@ def wait_for_completion(task_id: str, al_id: str) -> str:
                   f"({detail.get('waiting_for_event_type', 'unknown')}): "
                   f"{detail.get('waiting_description', '')!r}. "
                   f"Not auto-confirming — flagging and moving on.")
+            # DIAGNOSTIC added 2026-09-06: the short status_update event
+            # never carries which connector actually expired (confirmed
+            # empty waiting_description on every real occurrence so far).
+            # task.detail is a different, richer endpoint that might. This
+            # is read-only and evaluation-only, same treatment as the
+            # credit_usage fetch below — a failure here must never turn a
+            # real "waiting" result into something else.
+            try:
+                print(f"  [{al_id}] task.detail for diagnosis: "
+                      f"{get_task_detail(task_id)}")
+            except requests.HTTPError as e:
+                print(f"  [{al_id}] (could not fetch task.detail for "
+                      f"diagnosis: {e})")
             return "waiting"
         time.sleep(POLL_INTERVAL_SECONDS)
     print(f"  [{al_id}] TIMEOUT after {POLL_TIMEOUT_SECONDS}s waiting on {task_id} "
