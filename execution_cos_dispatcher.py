@@ -145,7 +145,28 @@ DIGEST_TO = os.environ.get("DIGEST_TO") or DIGEST_SMTP_USER
 # classification verify_noop_gate.py uses, because it's the one string the
 # skill is instructed to emit for this exact case, not an inference from
 # transcript shape.
-NO_OP_PHRASE = "no changes since last check"
+# CONFIRMED 2026-09-07: the single exact phrase below missed a real no-op
+# run -- the skill reported "its body was not rewritten because no
+# project-specific substantive changes were found" instead of the literal
+# SKILL.md Step 4 phrase, so classify_for_digest defaulted it to "update"
+# and it showed up mislabeled. Widened to a short list of strong, narrowly-
+# targeted phrases rather than a loose fuzzy match: each one specifically
+# describes the skill NOT rewriting the Brain body, which a genuine update
+# would essentially never say (a real update, by definition, rewrites the
+# body). Deliberately NOT widened with looser patterns like "no changes
+# found" or "nothing new" -- those risk false-matching a real update that
+# merely mentions "no changes" to ONE thing in passing, and unlike the
+# no-op-gate VIOLATION check in verify_noop_gate.py (which only flags a
+# problem for a human to look at), a false "quiet" classification HERE
+# hides that project's summary text entirely -- the quiet bucket only ever
+# shows an AL ID, never the text. Better to occasionally show a genuinely
+# quiet project under "update" (mislabeled but still fully visible) than
+# to occasionally hide a genuine update under "quiet" (invisible).
+NO_OP_PHRASES = [
+    "no changes since last check",
+    "not rewritten",
+    "left untouched",
+]
 ESCALATION_PHRASE = "escalation required"
 
 POLL_INTERVAL_SECONDS = 20
@@ -642,11 +663,13 @@ def classify_for_digest(final_summary: str) -> str:
     OWN literal output strings, not an inference over tool-call shape (that
     fuzzier approach is what verify_noop_gate.py uses, appropriate for its
     narrow violation-detection job, but not precise enough here). Returns
-    one of "escalation" / "quiet" / "update"."""
+    one of "escalation" / "quiet" / "update". See NO_OP_PHRASES above for
+    why this checks several specific phrases rather than one exact string
+    or a loose fuzzy pattern."""
     lower = final_summary.lower()
     if ESCALATION_PHRASE in lower:
         return "escalation"
-    if NO_OP_PHRASE in lower:
+    if any(phrase in lower for phrase in NO_OP_PHRASES):
         return "quiet"
     return "update"
 
@@ -661,20 +684,10 @@ def classify_for_digest(final_summary: str) -> str:
 # for accessibility and for any client that doesn't. `tables` extension is
 # required -- without it, markdown-formatted tables render as a literal
 # paragraph of "|" characters instead of an actual <table>.
-DIGEST_SUMMARY_MAX_CHARS = 1500
-
-
-def _truncate_at_boundary(text: str, max_chars: int) -> str:
-    """Truncates at the last newline before max_chars rather than a hard
-    character cut, so a markdown table or list isn't sliced mid-row --
-    which would render as a broken/incomplete table or malformed list in
-    the HTML version rather than just losing some trailing prose."""
-    if len(text) <= max_chars:
-        return text
-    cut = text.rfind("\n", 0, max_chars)
-    if cut <= 0:
-        cut = max_chars
-    return text[:cut].rstrip() + "\n\n*(truncated)*"
+#
+# NOT truncated (removed 2026-09-07 per Tomás, after a real escalation got
+# cut off mid-explanation) -- escalations especially are exactly the case
+# where losing detail hurts most, so every summary is shown in full.
 
 
 def build_digest_email(results: list, run_seconds: float) -> tuple:
@@ -700,13 +713,13 @@ def build_digest_email(results: list, run_seconds: float) -> tuple:
         text_lines.append(f"⚠️ ESCALATIONS ({len(escalations)})")
         for r in escalations:
             text_lines.append(f"  {r['al_id']} {r['name']}")
-            text_lines.append(f"    {_truncate_at_boundary(r['summary'], DIGEST_SUMMARY_MAX_CHARS)}")
+            text_lines.append(f"    {r['summary']}")
         text_lines.append("")
     if updates:
         text_lines.append(f"📋 REAL UPDATES ({len(updates)}) — something changed")
         for r in updates:
             text_lines.append(f"  {r['al_id']} {r['name']}")
-            text_lines.append(f"    {_truncate_at_boundary(r['summary'], DIGEST_SUMMARY_MAX_CHARS)}")
+            text_lines.append(f"    {r['summary']}")
         text_lines.append("")
     if attention:
         text_lines.append(f"❌ NEEDS ATTENTION ({len(attention)}) — dispatch problem")
@@ -723,8 +736,7 @@ def build_digest_email(results: list, run_seconds: float) -> tuple:
     # ---- HTML version ----
     def project_card(r, accent):
         summary_html = markdown_lib.markdown(
-            _truncate_at_boundary(r["summary"], DIGEST_SUMMARY_MAX_CHARS),
-            extensions=["tables", "fenced_code", "nl2br"])
+            r["summary"], extensions=["tables", "fenced_code", "nl2br"])
         al_id = html.escape(r["al_id"])
         name = html.escape(r.get("name", ""))
         return f"""
