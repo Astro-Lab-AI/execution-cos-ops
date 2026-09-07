@@ -67,7 +67,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests google-api-python-client google-auth
+        # markdown (with the tables extension) added 2026-09-07 to render
+        # the digest email as real HTML instead of showing raw "##"/"**"/
+        # "|---|" markdown symbols as literal text.
+        run: pip install requests google-api-python-client google-auth markdown
 
       - name: Write service account credentials
         run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
