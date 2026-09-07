@@ -1,0 +1,33 @@
+# .github/workflows/send-test-digest.yml
+#
+# One-off manual trigger for send_test_digest.py: sends a REAL digest email
+# built from transcripts of tasks that already completed in a prior real
+# dispatch run, to verify the HTML formatting fix (#10) against real
+# content without dispatching a brand-new batch of 14 tasks. Zero new
+# Manus credits spent -- fetches existing transcripts only.
+
+name: Send Test Digest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests markdown
+
+      - name: Run send_test_digest.py
+        env:
+          MANUS_API_KEY: ${{ secrets.MANUS_API_KEY }}
+          DIGEST_SMTP_USER: ${{ secrets.DIGEST_SMTP_USER }}
+          DIGEST_SMTP_PASS: ${{ secrets.DIGEST_SMTP_PASS }}
+        run: python -u send_test_digest.py
