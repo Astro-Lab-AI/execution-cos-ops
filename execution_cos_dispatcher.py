@@ -192,6 +192,22 @@ PROPAGATION_RETRY_INTERVAL_SECONDS = 3
 SERVER_ERROR_RETRY_ATTEMPTS = 3
 SERVER_ERROR_RETRY_INTERVAL_SECONDS = 10
 
+# CONFIRMED 2026-09-09: not every "waiting" status is a real block on human
+# input. AL-2026-033's task briefly reported waiting_for_event_type
+# "cascadeJobCall" ("Manus is waiting for tasks to finish") for ~56 seconds,
+# then resumed running on its own and finished normally 275s after
+# starting -- well inside POLL_TIMEOUT_SECONDS. The dispatcher polled
+# during that exact 56s window, saw "waiting", and gave up immediately,
+# abandoning a task that was actually still healthy and progressing. This
+# is Manus's own internal orchestration checkpoint (waiting on its OWN
+# sub-work), not the same thing as gmailSendAction/deployAction-style
+# waiting states that genuinely need a human to click something -- those
+# must still stop immediately, per the reasoning in wait_for_completion's
+# docstring. Only event types confirmed to be self-resolving belong here;
+# defaulting anything unconfirmed to "stop and flag" remains the safe
+# choice.
+SELF_RESOLVING_WAITING_EVENT_TYPES = {"cascadeJobCall"}
+
 # CONFIRMED 2026-08-20: the scheduled run failed with an uncaught
 # TimeoutError from a plain network read timeout talking to the Sheets API
 # (googleapiclient -> httplib2 -> socket), before a single Manus task was
@@ -610,14 +626,19 @@ def wait_for_completion(task_id: str, al_id: str) -> str:
     number of times on 5xx before giving up -- same reasoning as the 404
     grace window above, just for a different transient-failure shape.
 
-    'waiting' is deliberately NOT auto-confirmed here. Some waiting events
-    (gmailSendAction, deployAction) have real-world side effects, and the
-    skill's own rules already require explicit human confirmation before
-    taking action — a headless dispatcher blindly accepting those would
-    violate that. If connectors/skill are correctly passed at creation
-    (see create_task), 'waiting' should be rare for a read-and-write-a-doc
-    task; if it happens anyway, this surfaces it and moves on rather than
-    guessing what to click."""
+    'waiting' is deliberately NOT auto-confirmed here for MOST event types.
+    Some waiting events (gmailSendAction, deployAction) have real-world side
+    effects, and the skill's own rules already require explicit human
+    confirmation before taking action — a headless dispatcher blindly
+    accepting those would violate that. If connectors/skill are correctly
+    passed at creation (see create_task), 'waiting' should be rare for a
+    read-and-write-a-doc task; if it happens anyway, this surfaces it and
+    moves on rather than guessing what to click.
+
+    EXCEPTION, confirmed 2026-09-09: SELF_RESOLVING_WAITING_EVENT_TYPES
+    (see above) are Manus-internal orchestration checkpoints, not a real
+    block on a human — those get treated like 'running' and polling
+    continues, instead of abandoning a task that's actually still healthy."""
     created_at = time.time()
     deadline = created_at + POLL_TIMEOUT_SECONDS
     server_error_retries = 0
@@ -646,8 +667,16 @@ def wait_for_completion(task_id: str, al_id: str) -> str:
             return status
         if status == "waiting":
             detail = data.get("detail") or {}
+            event_type = detail.get("waiting_for_event_type", "unknown")
+            if event_type in SELF_RESOLVING_WAITING_EVENT_TYPES:
+                print(f"  [{al_id}] task briefly waiting ({event_type}): "
+                      f"{detail.get('waiting_description', '')!r} — a known "
+                      f"Manus-internal checkpoint, not a human-confirmation "
+                      f"block. Continuing to poll.")
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
             print(f"  [{al_id}] task is WAITING on a human "
-                  f"({detail.get('waiting_for_event_type', 'unknown')}): "
+                  f"({event_type}): "
                   f"{detail.get('waiting_description', '')!r}. "
                   f"Not auto-confirming — flagging and moving on.")
             # DIAGNOSTIC added 2026-09-06: the short status_update event
