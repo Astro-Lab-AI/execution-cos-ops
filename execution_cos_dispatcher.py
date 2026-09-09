@@ -441,10 +441,35 @@ def create_task(prompt: str, connector_ids: list, skill_id) -> str:
     }
     if skill_id:
         body["message"]["force_skills"] = [skill_id]
-    resp = requests.post(f"{MANUS_API_BASE}/task.create",
-                          headers=_manus_headers(), json=body, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["task_id"]
+    # CONFIRMED 2026-09-07: a plain 500 from Manus on this exact call
+    # skipped AL-2026-077 for the entire day (caught in run(), which
+    # already treats a create failure as non-fatal for the whole batch --
+    # this just meant that one project got no update until the next day's
+    # run picked it up on its own). Retrying a POST that creates a
+    # resource is riskier than retrying the GET-based status poll above --
+    # if a 500 actually meant "succeeded but the response was lost" rather
+    # than "genuinely failed," a retry could create a second Manus task
+    # for the same project. Accepted as safe: SKILL.md Step 2's own
+    # duplicate-prevention logic means a second task would find the
+    # Project_Brain the first one already created and treat it as an
+    # update, not create a duplicate -- worst case is wasted credits for
+    # one project one day, not data corruption, which is a better trade
+    # than silently skipping a project for a full day on a transient error.
+    for attempt in range(1, SERVER_ERROR_RETRY_ATTEMPTS + 2):
+        try:
+            resp = requests.post(f"{MANUS_API_BASE}/task.create",
+                                  headers=_manus_headers(), json=body, timeout=30)
+            resp.raise_for_status()
+            return resp.json()["task_id"]
+        except requests.HTTPError as e:
+            if (e.response is not None and e.response.status_code >= 500
+                    and attempt <= SERVER_ERROR_RETRY_ATTEMPTS):
+                print(f"  Manus API returned {e.response.status_code} "
+                      f"creating task (attempt {attempt}/{SERVER_ERROR_RETRY_ATTEMPTS}), "
+                      f"retrying in {SERVER_ERROR_RETRY_INTERVAL_SECONDS}s...")
+                time.sleep(SERVER_ERROR_RETRY_INTERVAL_SECONDS)
+                continue
+            raise
 
 
 def get_task_detail(task_id: str) -> dict:
